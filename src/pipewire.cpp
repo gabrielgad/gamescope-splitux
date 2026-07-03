@@ -95,7 +95,46 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
 	struct spa_rectangle min_requested_size = { 0, 0 };
 	struct spa_rectangle max_requested_size = { UINT32_MAX, UINT32_MAX };
 	struct spa_fraction framerate = SPA_FRACTION(0, 1);
-	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+
+	// NV12 export modifiers: queried straight from the physical device, not
+	// GetBackend()->UsesModifiers() (this image is exported to PipeWire and
+	// never re-imported into the backend, so the parent compositor's scanout
+	// modifier knowledge doesn't apply). Re-enabled 2026-07-01: live testing
+	// on 2026-06-30 found the seat-streamer consumer's tiled import faulting
+	// the GPU ("radv: GPUVM fault detected") because gst-dmabuf-vulkan's
+	// meta-repair heuristic was unconditionally overwriting plane 1's real,
+	// Vulkan-queried tiled offset/stride with a LINEAR-only packing formula;
+	// fixed consumer-side (gstdmabufvulkan.c, gated that heuristic to
+	// DRM_FORMAT_MOD_LINEAR only) — safe to offer tiled modifiers again.
+	//
+	// Usage is TRANSFER_DST only — deliberately NOT VK_IMAGE_USAGE_STORAGE_BIT.
+	// This must match the actual export texture's usage in
+	// stream_handle_add_buffer: RADV rejects every exportable NV12 modifier,
+	// including LINEAR-as-a-modifier, the instant STORAGE_BIT is requested
+	// (verified via a standalone probe), so querying with STORAGE_BIT here
+	// always returned zero candidates and this function silently offered only
+	// LINEAR regardless of what the driver can actually do.
+	std::vector<uint64_t> modifiers = vulkan_get_exportable_modifiers(
+		DRM_FORMAT_NV12, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+	bool hasLinear = false;
+	for (uint64_t m : modifiers) {
+		if (m == DRM_FORMAT_MOD_LINEAR) {
+			hasLinear = true;
+			break;
+		}
+	}
+	if (!hasLinear)
+		modifiers.push_back(DRM_FORMAT_MOD_LINEAR);
+
+	{
+		std::string modlist;
+		for (uint64_t m : modifiers) {
+			char buf[32];
+			snprintf(buf, sizeof(buf), "0x%llx ", (unsigned long long)m);
+			modlist += buf;
+		}
+		pwr_log.infof("splitux: offering %zu NV12 export modifier candidate(s): %s", modifiers.size(), modlist.c_str());
+	}
 
 	struct spa_pod_frame obj_frame, choice_frame;
 	spa_pod_builder_push_object(builder, &obj_frame, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
@@ -120,10 +159,26 @@ static void build_format_params(struct spa_pod_builder *builder, spa_video_forma
 							SPA_VIDEO_COLOR_RANGE_0_255),
 			0);
 	}
+	// CORRECTED 2026-07-01 (same day, later in the session): an earlier A/B
+	// test here concluded the consumer "genuinely cannot import ANY tiled
+	// modifier" after pinning to a fixed tiled value made negotiation fail
+	// outright. That test was confounded — at the time, the consumer's own
+	// sink caps (gstdmabufvulkan.c) built a bare "NV12" drm-format string,
+	// which GStreamer's own gst_video_dma_drm_fourcc_from_string() resolves
+	// to DRM_FORMAT_MOD_LINEAR (there is no "let PipeWire negotiate it below
+	// us" wildcard), so the consumer was only ever asking for LINEAR
+	// regardless of what gamescope offered. Fixed consumer-side (explicit
+	// per-modifier drm-format entries + a pipewiresrc default-choice
+	// ordering fix) — re-ran the SAME single-fixed-modifier test afterward
+	// and it succeeded (real tiled modifier negotiated + imported, no
+	// faults). Real tiled import works; keep offering the full candidate
+	// list (tiled preferred, LINEAR always last) as the safety net for a
+	// driver/consumer that genuinely can't do better.
 	spa_pod_builder_prop(builder, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
 	spa_pod_builder_push_choice(builder, &choice_frame, SPA_CHOICE_Enum, 0);
-	spa_pod_builder_long(builder, modifier); // default
-	spa_pod_builder_long(builder, modifier);
+	spa_pod_builder_long(builder, modifiers[0]); // default: prefer the backend's first (tiled) modifier
+	for (uint64_t m : modifiers)
+		spa_pod_builder_long(builder, m);
 	spa_pod_builder_pop(builder, &choice_frame);
 	params.push_back((const struct spa_pod *) spa_pod_builder_pop(builder, &obj_frame));
 
@@ -212,12 +267,11 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 		*requested_size_scale = ((float)tex->width() / g_nOutputWidth);
 	}
 
-	struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
-	chunk->flags = needs_reneg ? SPA_CHUNK_FLAG_CORRUPTED : 0;
-
 	struct wlr_dmabuf_attributes dmabuf;
 	switch (buffer->type) {
-	case SPA_DATA_MemFd:
+	case SPA_DATA_MemFd: {
+		struct spa_chunk *chunk = spa_buffer->datas[0].chunk;
+		chunk->flags = needs_reneg ? SPA_CHUNK_FLAG_CORRUPTED : 0;
 		chunk->offset = 0;
 		chunk->size = state->video_info.size.height * buffer->shm.stride;
 		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
@@ -256,14 +310,25 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 			}
 		}
 		break;
+	}
 	case SPA_DATA_DmaBuf:
 		dmabuf = tex->dmabuf();
-		assert(dmabuf.n_planes == 1);
-		chunk->offset = dmabuf.offset[0];
-		chunk->stride = dmabuf.stride[0];
-		chunk->size = dmabuf.height * chunk->stride;
-		if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
-			chunk->size += ((dmabuf.height + 1)/2 * chunk->stride);
+		for (int i = 0; i < dmabuf.n_planes; i++) {
+			struct spa_chunk *plane_chunk = spa_buffer->datas[i].chunk;
+			plane_chunk->flags = needs_reneg ? SPA_CHUNK_FLAG_CORRUPTED : 0;
+			plane_chunk->offset = dmabuf.offset[i];
+			plane_chunk->stride = dmabuf.stride[i];
+			if (state->video_info.format == SPA_VIDEO_FORMAT_NV12 && dmabuf.n_planes == 1) {
+				// Single combined plane: luma then chroma packed sequentially
+				// (matches the MemFd layout above).
+				plane_chunk->size = dmabuf.height * plane_chunk->stride;
+				plane_chunk->size += ((dmabuf.height + 1)/2 * plane_chunk->stride);
+			} else if (i == 0) {
+				plane_chunk->size = dmabuf.height * plane_chunk->stride;
+			} else {
+				// Separate chroma memory plane (4:2:0 subsampled height).
+				plane_chunk->size = ((dmabuf.height + 1)/2) * plane_chunk->stride;
+			}
 		}
 		break;
 	default:
@@ -301,6 +366,8 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
 		break;
 	}
 }
+
+uint32_t spa_format_to_drm(uint32_t spa_format);
 
 static void stream_handle_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 {
@@ -349,11 +416,26 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	}
 	int data_type = state->dmabuf ? (1 << SPA_DATA_DmaBuf) : (1 << SPA_DATA_MemFd);
 
+	// A DMA-BUF modifier export (e.g. NV12 luma+chroma) needs one spa_data
+	// "block" per real memory plane; reserve them up front since blocks isn't
+	// renegotiable per-buffer. Only non-dmabuf (memfd/shm — no modifier at
+	// all, DRM_FORMAT_MOD_INVALID) stays at 1: DRM_FORMAT_MOD_LINEAR used AS
+	// A MODIFIER (the dmabuf-export path) still reports 2 real planes for
+	// NV12 on this driver, same as any other modifier — see
+	// vulkan_get_drm_format_modifier_plane_count.
+	int blocks = 1;
+	if (state->dmabuf) {
+		uint32_t drmFormat = spa_format_to_drm(state->video_info.format);
+		blocks = (int) vulkan_get_drm_format_modifier_plane_count(drmFormat, state->video_info.modifier);
+	}
+	pwr_log.infof("splitux: negotiated modifier=0x%llx blocks=%d dmabuf=%d",
+		(unsigned long long) state->video_info.modifier, blocks, (int) state->dmabuf);
+
 	const struct spa_pod *buffers_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 64),
-		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
 		SPA_PARAM_BUFFERS_size, SPA_POD_Int(shm_size),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->shm_stride),
 		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_type));
@@ -470,13 +552,49 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 	buffer->texture = new CVulkanTexture();
 	CVulkanTexture::createFlags screenshotImageFlags;
-	screenshotImageFlags.bMappable = true;
 	screenshotImageFlags.bTransferDst = true;
-	screenshotImageFlags.bStorage = true;
-	if (is_dmabuf || drmFormat == DRM_FORMAT_NV12)
+	if (is_dmabuf)
 	{
+		// Export natively tiled (the encoder's preferred layout) instead of
+		// forcing LINEAR: avoids the linear->tiled relayout the consumer would
+		// otherwise have to do on the GPU (contending with game render). Not
+		// bMappable — dmabuf consumers import the fd, they don't CPU-map it.
+		//
+		// Deliberately NOT bStorage here. Verified via a standalone Vulkan
+		// probe against this GPU/driver: RADV exposes real tiled NV12
+		// modifiers (8 of them on RX 9070/GFX1201), all fully exportable --
+		// but every one, including plain LINEAR-as-a-modifier, loses
+		// EXTERNAL_MEMORY_FEATURE_EXPORTABLE the instant
+		// VK_IMAGE_USAGE_STORAGE_BIT is in the usage set. Requesting it here
+		// unconditionally forced the "no exportable tiled modifier" LINEAR
+		// fallback below, every frame, regardless of what the driver can
+		// actually do. The RGB->NV12 compute shader (vulkan_screenshot) still
+		// needs a STORAGE-capable write target, so that's `compute_texture`
+		// now (OPTIMAL, internal-only, allocated below) — paint_pipewire
+		// copies its output into this export texture afterward
+		// (CVulkanCmdBuffer::copyImage, chained into the same command buffer
+		// as the compute dispatch), which only needs TRANSFER_DST/_SRC.
 		screenshotImageFlags.bExportable = true;
-		screenshotImageFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
+		screenshotImageFlags.bExportTiled = true;
+		// Pin to the modifier already fixated by SPA format negotiation (the
+		// consumer was already told the resulting plane count via this same
+		// state->video_info.modifier -> blocks in stream_handle_param_changed)
+		// so the texture BInit actually creates can't diverge from it.
+		if (state->video_info.modifier != DRM_FORMAT_MOD_INVALID)
+			screenshotImageFlags.uExplicitExportModifier = state->video_info.modifier;
+	}
+	else
+	{
+		// memfd path: the compute shader writes directly into this texture
+		// (no separate export step, so no modifier/STORAGE conflict — this
+		// isn't modifier-tiled at all), so it keeps bStorage.
+		screenshotImageFlags.bStorage = true;
+		screenshotImageFlags.bMappable = true;
+		if (drmFormat == DRM_FORMAT_NV12)
+		{
+			screenshotImageFlags.bExportable = true;
+			screenshotImageFlags.bLinear = true;
+		}
 	}
 	bool bImageInitSuccess = buffer->texture->BInit( s_nCaptureWidth, s_nCaptureHeight, 1u, drmFormat, screenshotImageFlags );
 	if ( !bImageInitSuccess )
@@ -486,14 +604,44 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 	}
 	buffer->texture->setStreamColorspace(colorspace);
 
+	if (is_dmabuf && drmFormat == DRM_FORMAT_NV12)
+	{
+		// See the flags comment above: the export texture above can't be the
+		// compute shader's write target on this hardware, so give it a
+		// separate OPTIMAL-tiled, STORAGE-capable scratch target instead. It
+		// never leaves the GPU (no bExportable/bExportTiled/bLinear/bMappable),
+		// so its own tiling can be whatever RADV prefers for fastest
+		// storage-image writes.
+		buffer->compute_texture = new CVulkanTexture();
+		CVulkanTexture::createFlags computeImageFlags;
+		computeImageFlags.bStorage = true;
+		computeImageFlags.bTransferSrc = true;
+		if ( !buffer->compute_texture->BInit( s_nCaptureWidth, s_nCaptureHeight, 1u, drmFormat, computeImageFlags ) )
+		{
+			pwr_log.errorf("Failed to initialize pipewire compute texture");
+			goto error;
+		}
+		buffer->compute_texture->setStreamColorspace(colorspace);
+	}
+
 	if (is_dmabuf) {
 		const struct wlr_dmabuf_attributes dmabuf = buffer->texture->dmabuf();
-		if (dmabuf.n_planes != 1)
+		if (dmabuf.n_planes < 1 || (size_t) dmabuf.n_planes > SPA_N_ELEMENTS(dmabuf.fd))
 		{
-			pwr_log.errorf("dmabuf.n_planes != 1");
+			pwr_log.errorf("dmabuf.n_planes out of range (%d)", dmabuf.n_planes);
+			goto error;
+		}
+		if ((uint32_t) dmabuf.n_planes > spa_buffer->n_datas)
+		{
+			// blocks negotiated via SPA_PARAM_Buffers (stream_handle_param_changed)
+			// didn't reserve enough data slots for this modifier's plane count.
+			pwr_log.errorf("dmabuf.n_planes (%d) > spa_buffer->n_datas (%d)", dmabuf.n_planes, spa_buffer->n_datas);
 			goto error;
 		}
 
+		// A tiled multi-plane export (e.g. NV12 luma+chroma) may share a single
+		// underlying dmabuf across planes (one fd dup'd per plane, see
+		// CVulkanTexture::BInit), so every dup'd fd reports the same overall size.
 		off_t size = lseek(dmabuf.fd[0], 0, SEEK_END);
 		if (size < 0) {
 			pwr_log.errorf_errno("lseek failed");
@@ -502,12 +650,16 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 		buffer->type = SPA_DATA_DmaBuf;
 
-		spa_data->type = SPA_DATA_DmaBuf;
-		spa_data->flags = SPA_DATA_FLAG_READABLE;
-		spa_data->fd = dmabuf.fd[0];
-		spa_data->mapoffset = dmabuf.offset[0];
-		spa_data->maxsize = size;
-		spa_data->data = nullptr;
+		for (int i = 0; i < dmabuf.n_planes; i++)
+		{
+			struct spa_data *plane_data = &spa_buffer->datas[i];
+			plane_data->type = SPA_DATA_DmaBuf;
+			plane_data->flags = SPA_DATA_FLAG_READABLE;
+			plane_data->fd = dmabuf.fd[i];
+			plane_data->mapoffset = dmabuf.offset[i];
+			plane_data->maxsize = size;
+			plane_data->data = nullptr;
+		}
 	} else if (is_memfd) {
 		int fd = anonymous_shm_open();
 		if (fd < 0) {
@@ -735,7 +887,16 @@ struct pipewire_buffer *pipewire_dequeue_buffer(void)
 	pw_thread_loop_lock(state->thread_loop);
 	maybe_renegotiate_size_locked(state);
 	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
+	// Consecutive dequeue failures. Transient starvation (producer briefly
+	// outrunning the consumer) always recovers within a handful of frames via
+	// the trigger below; hundreds of CONSECUTIVE failures only happen in the
+	// permanently-wedged state (observed 2026-07-02: game video-mode changes
+	// during world-load transitions leave every pool buffer stranded on the
+	// consumer side forever — the stream then re-delivers one stale frame
+	// eternally while all rate counters look alive).
+	static uint32_t s_nConsecutiveDequeueFails = 0;
 	if (pw_buffer) {
+		s_nConsecutiveDequeueFails = 0;
 		buffer = (struct pipewire_buffer *) pw_buffer->user_data;
 		buffer->in_producer = true;
 	} else {
@@ -752,6 +913,28 @@ struct pipewire_buffer *pipewire_dequeue_buffer(void)
 		static int s_nOOB = 0;
 		if ((s_nOOB++ % 200) == 0)
 			pwr_log.errorf("warning: out of buffers (draining consumer backlog)");
+
+		// SELF-HEAL for the permanent wedge: past the threshold, tear the
+		// stream down and reconnect it in place — full param renegotiation,
+		// fresh buffer pool, new node serial. The consumer (seat-streamer's
+		// pipewiresrc, bound to the old serial) errors out and its session
+		// rebuilds against the new node by NAME, and the browser auto-rejoins
+		// — every link of that recovery chain is existing, exercised behavior.
+		// Net effect: a ~2s video blip instead of a freeze-until-relaunch.
+		// Threshold ≈ 3-10s of paint attempts with not one success; reset on
+		// every successful dequeue so transient drains can never trip it.
+		if (++s_nConsecutiveDequeueFails >= 600) {
+			pwr_log.errorf("export pool starved for %u consecutive paints — reconnecting the stream to rebuild the buffer pool", s_nConsecutiveDequeueFails);
+			s_nConsecutiveDequeueFails = 0;
+			pw_stream_disconnect(state->stream);
+			uint8_t buf[4096];
+			struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+			std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
+			enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS | PW_STREAM_FLAG_INACTIVE);
+			int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
+			if (ret != 0)
+				pwr_log.errorf("self-heal pw_stream_connect failed (%d) — capture stays down until session relaunch", ret);
+		}
 	}
 	pw_thread_loop_unlock(state->thread_loop);
 

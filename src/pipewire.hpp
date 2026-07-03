@@ -40,6 +40,15 @@ struct pipewire_buffer {
 	struct spa_gamescope gamescope_info;
 	gamescope::OwningRc<CVulkanTexture> texture;
 
+	// Internal-only RGB->NV12 compute-shader target when `texture` is a
+	// dmabuf-exported, tiled-modifier image (see stream_handle_add_buffer):
+	// RADV rejects every exportable NV12 modifier -- including LINEAR-as-a-
+	// modifier -- the instant VK_IMAGE_USAGE_STORAGE_BIT is requested, so the
+	// compute shader can't write into the export texture directly on this
+	// hardware. Null for the memfd path, where `texture` itself is still the
+	// compute target (no modifier/export conflict there).
+	gamescope::OwningRc<CVulkanTexture> compute_texture;
+
 	// Only used for SPA_DATA_MemFd
 	struct {
 		int stride;
