@@ -2486,10 +2486,30 @@ static void paint_pipewire()
 		? vulkan_acquire_screenshot_texture( uWidth, uHeight, false, DRM_FORMAT_XRGB2101010 )
 		: gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
 
-	gamescope::Rc<CVulkanTexture> pYUVTexture = s_pPipewireBuffer->texture->isYcbcr() ? s_pPipewireBuffer->texture : nullptr;
+	// splitux: the RGB->NV12 compute shader dispatched below needs a
+	// STORAGE-capable write target. For a dmabuf-exported, tiled-modifier
+	// texture that can't be s_pPipewireBuffer->texture itself (see
+	// stream_handle_add_buffer) — compute_texture is the internal scratch
+	// target instead, and pYUVExportTexture tells vulkan_screenshot to copy
+	// the finished frame into the real export texture afterward. Null
+	// compute_texture (the memfd path) means texture is already a safe
+	// compute target, so no split/copy is needed.
+	gamescope::Rc<CVulkanTexture> pYUVTexture = nullptr;
+	gamescope::Rc<CVulkanTexture> pYUVExportTexture = nullptr;
+	if ( s_pPipewireBuffer->texture->isYcbcr() )
+	{
+		if ( s_pPipewireBuffer->compute_texture )
+		{
+			pYUVTexture = gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->compute_texture };
+			pYUVExportTexture = gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
+		}
+		else
+		{
+			pYUVTexture = gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
+		}
+	}
 
-
-	std::optional<uint64_t> oPipewireSequence = vulkan_screenshot( &frameInfo, pRGBTexture, pYUVTexture );
+	std::optional<uint64_t> oPipewireSequence = vulkan_screenshot( &frameInfo, pRGBTexture, pYUVTexture, pYUVExportTexture );
 	// If we ever want the fat compositing path, use this.
 	//std::optional<uint64_t> oPipewireSequence = vulkan_composite( &frameInfo, s_pPipewireBuffer->texture, false, pRGBTexture, false );
 

@@ -139,9 +139,11 @@ public:
 			bTransferDst = false;
 			bLinear = false;
 			bExportable = false;
+			bExportTiled = false;
 			bOutputImage = false;
 			bColorAttachment = false;
 			imageType = VK_IMAGE_TYPE_2D;
+			uExplicitExportModifier = DRM_FORMAT_MOD_INVALID;
 		}
 
 		bool bFlippable : 1;
@@ -152,9 +154,23 @@ public:
 		bool bTransferDst : 1;
 		bool bLinear : 1;
 		bool bExportable : 1;
+		// Like bFlippable, take the DRM-format-modifier tiling path (queries
+		// GetBackend()->GetSupportedModifiers() and exports natively tiled), but
+		// without bFlippable's side effects (WSI scanout image, backend FB
+		// import via ImportDmabufToBackend) — for buffers that are exported for
+		// an external consumer (e.g. encoder via PipeWire) and never scanned out.
+		bool bExportTiled : 1;
 		bool bOutputImage : 1;
 		bool bColorAttachment : 1;
 		VkImageType imageType;
+		// bExportTiled only: pin the export to exactly this modifier instead of
+		// picking freely from every backend-supported modifier. Set this to the
+		// modifier a consumer already fixated at the protocol level (e.g. SPA
+		// format negotiation) so the image gamescope actually allocates matches
+		// what was already promised (plane count, blocks) — letting the driver
+		// choose freely from the full set here would silently desync from that
+		// out-of-band agreement. DRM_FORMAT_MOD_INVALID = no pin, use the full set.
+		uint64_t uExplicitExportModifier;
 	};
 
 	bool BInit( uint32_t width, uint32_t height, uint32_t depth, uint32_t drmFormat, createFlags flags, wlr_dmabuf_attributes *pDMA = nullptr, uint32_t contentWidth = 0, uint32_t contentHeight = 0, CVulkanTexture *pExistingImageToReuseMemory = nullptr, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb = nullptr );
@@ -422,6 +438,8 @@ bool acquire_next_image( void );
 
 bool vulkan_primary_dev_id(dev_t *id);
 bool vulkan_supports_modifiers(void);
+uint32_t vulkan_get_drm_format_modifier_plane_count( uint32_t drmFormat, uint64_t modifier );
+std::vector<uint64_t> vulkan_get_exportable_modifiers( uint32_t drmFormat, VkImageUsageFlags usage );
 
 gamescope::Rc<CVulkanTexture> vulkan_create_1d_lut(uint32_t size);
 gamescope::Rc<CVulkanTexture> vulkan_create_3d_lut(uint32_t width, uint32_t height, uint32_t depth);
@@ -429,7 +447,11 @@ void vulkan_update_luts(const gamescope::Rc<CVulkanTexture>& lut1d, const gamesc
 
 gamescope::Rc<CVulkanTexture> vulkan_get_hacky_blank_texture();
 
-std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, gamescope::Rc<CVulkanTexture> pYUVOutTexture );
+// `pYUVExportTexture`, when non-null, is copied into (CVulkanCmdBuffer::copyImage,
+// same command buffer as the RGB->NV12 dispatch) right after pYUVOutTexture is
+// written — for callers whose real dmabuf-exported target can't itself be the
+// compute shader's write target (see pipewire.cpp's stream_handle_add_buffer).
+std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, gamescope::Rc<CVulkanTexture> pYUVOutTexture, gamescope::Rc<CVulkanTexture> pYUVExportTexture = nullptr );
 
 struct wlr_renderer *vulkan_renderer_create( void );
 

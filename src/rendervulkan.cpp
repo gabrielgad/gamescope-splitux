@@ -1792,23 +1792,52 @@ void CVulkanCmdBuffer::copyImage(gamescope::Rc<CVulkanTexture> src, gamescope::R
 	prepareDestImage(dst.get());
 	insertBarrier();
 
-	VkImageCopy region = {
-		.srcSubresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			.layerCount = 1
-		},
-		.dstSubresource = {
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-			.layerCount = 1
-		},
-		.extent = {
-			.width = src->width(),
-			.height = src->height(),
-			.depth = 1
-		},
-	};
+	if (src->isYcbcr())
+	{
+		// Multi-planar (NV12): copy each plane with its own explicit PLANE_i
+		// aspect region instead of one opaque COLOR-aspect region. A single
+		// COLOR-aspect VkImageCopy is spec-legal for a non-disjoint
+		// multi-planar image, but this is splitux-together's pipewire capture
+		// texture split (see vulkan_screenshot/stream_handle_add_buffer): src
+		// is OPTIMAL-tiled, dst is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT —
+		// on this driver (RADV) the single-region opaque copy only reliably
+		// landed plane 0, leaving the export texture's chroma stale/zeroed
+		// (green frames downstream). Explicit per-plane regions sidestep any
+		// cross-tiling ambiguity in the opaque path.
+		VkImageCopy regions[2] = {
+			{
+				.srcSubresource = { .aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT, .layerCount = 1 },
+				.dstSubresource = { .aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT, .layerCount = 1 },
+				.extent = { src->width(), src->height(), 1 },
+			},
+			{
+				.srcSubresource = { .aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT, .layerCount = 1 },
+				.dstSubresource = { .aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT, .layerCount = 1 },
+				.extent = { (src->width() + 1) / 2, (src->height() + 1) / 2, 1 },
+			},
+		};
+		m_device->vk.CmdCopyImage(m_cmdBuffer, src->vkImage(), VK_IMAGE_LAYOUT_GENERAL, dst->vkImage(), VK_IMAGE_LAYOUT_GENERAL, 2, regions);
+	}
+	else
+	{
+		VkImageCopy region = {
+			.srcSubresource = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.layerCount = 1
+			},
+			.dstSubresource = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.layerCount = 1
+			},
+			.extent = {
+				.width = src->width(),
+				.height = src->height(),
+				.depth = 1
+			},
+		};
 
-	m_device->vk.CmdCopyImage(m_cmdBuffer, src->vkImage(), VK_IMAGE_LAYOUT_GENERAL, dst->vkImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+		m_device->vk.CmdCopyImage(m_cmdBuffer, src->vkImage(), VK_IMAGE_LAYOUT_GENERAL, dst->vkImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+	}
 
 	markDirty(dst.get());
 	m_textureRefs.emplace_back(std::move(src));
@@ -2154,11 +2183,23 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 
 	std::vector<uint64_t> modifiers = {};
 	// TODO(JoshA): Move this code to backend for making flippable image.
-	if ( GetBackend()->UsesModifiers() && flags.bFlippable && g_device.supportsModifiers() && !pDMA )
+	// bExportTiled takes this same modifier-list path as bFlippable (without
+	// bFlippable's scanout-only side effects below: WSI scanout image at
+	// VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA, and ImportDmabufToBackend).
+	// bExportTiled doesn't need the backend's blessing (GetBackend()->UsesModifiers())
+	// the way bFlippable does -- it's never re-imported into the backend for
+	// scanout, just handed to an external consumer, so the physical device's own
+	// modifier support (g_device.supportsModifiers(), checked below) is what
+	// actually matters for it.
+	if ( ( GetBackend()->UsesModifiers() || flags.bExportTiled ) && ( flags.bFlippable || flags.bExportTiled ) && g_device.supportsModifiers() && !pDMA )
 	{
 		assert( drmFormat != DRM_FORMAT_INVALID );
 
 		uint64_t linear = DRM_FORMAT_MOD_LINEAR;
+		// Backing storage for the bExportTiled-no-explicit-pin case below; must
+		// outlive the possibleModifiers pointer derived from it (used after
+		// this if/else chain, in the filter loop).
+		std::vector<uint64_t> exportTiledCandidates;
 
 		const uint64_t *possibleModifiers;
 		size_t numPossibleModifiers;
@@ -2167,12 +2208,35 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			possibleModifiers = &linear;
 			numPossibleModifiers = 1;
 		}
+		else if ( flags.bExportTiled && flags.uExplicitExportModifier != DRM_FORMAT_MOD_INVALID )
+		{
+			// A consumer already fixated this exact modifier out-of-band (e.g.
+			// PipeWire SPA format negotiation) and was told the resulting plane
+			// count/blocks based on it — pick freely from the full backend set
+			// here and we could silently allocate a DIFFERENT modifier than what
+			// was promised. Pin to exactly the negotiated one instead.
+			possibleModifiers = &flags.uExplicitExportModifier;
+			numPossibleModifiers = 1;
+		}
+		else if ( flags.bExportTiled )
+		{
+			// No modifier was pinned (e.g. a caller building a one-off export
+			// texture outside the negotiated-PipeWire-buffer path) -- fall back
+			// to the full physical-device catalog rather than the backend's
+			// parent-compositor-borrowed list (see vulkan_get_exportable_modifiers
+			// for why: this image is never re-imported into the backend).
+			exportTiledCandidates = vulkan_get_exportable_modifiers( drmFormat, usage );
+			possibleModifiers = exportTiledCandidates.data();
+			numPossibleModifiers = exportTiledCandidates.size();
+		}
 		else
 		{
-			std::span<const uint64_t> modifiers = GetBackend()->GetSupportedModifiers( drmFormat );
-			assert( !modifiers.empty() );
-			possibleModifiers = modifiers.data();
-			numPossibleModifiers = modifiers.size();
+			// bFlippable: the backend may have no (or no usable) modifiers for
+			// this drmFormat. Don't assert on that; fall through to the
+			// empty-modifiers handling below instead of crashing the compositor.
+			std::span<const uint64_t> backendModifiers = GetBackend()->GetSupportedModifiers( drmFormat );
+			possibleModifiers = backendModifiers.data();
+			numPossibleModifiers = backendModifiers.size();
 		}
 
 		for ( size_t i = 0; i < numPossibleModifiers; i++ )
@@ -2196,22 +2260,41 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 			modifiers.push_back( modifier );
 		}
 
-		assert( modifiers.size() > 0 );
+		if ( !modifiers.empty() )
+		{
+			modifierListInfo = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+				.pNext = std::exchange(imageInfo.pNext, &modifierListInfo),
+				.drmFormatModifierCount = uint32_t(modifiers.size()),
+				.pDrmFormatModifiers = modifiers.data(),
+			};
 
-		modifierListInfo = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-			.pNext = std::exchange(imageInfo.pNext, &modifierListInfo),
-			.drmFormatModifierCount = uint32_t(modifiers.size()),
-			.pDrmFormatModifiers = modifiers.data(),
-		};
+			externalImageCreateInfo = {
+				.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+				.pNext = std::exchange(imageInfo.pNext, &externalImageCreateInfo),
+				.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+			};
 
-		externalImageCreateInfo = {
-			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-			.pNext = std::exchange(imageInfo.pNext, &externalImageCreateInfo),
-			.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-		};
-
-		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+			imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+		}
+		else if ( flags.bExportTiled )
+		{
+			// No tiled modifier supports this format+usage combo (e.g. RADV
+			// rejects STORAGE usage on the device's NV12 tiled layouts) --
+			// export LINEAR instead of crashing the compositor. The PipeWire
+			// caller already advertises LINEAR as a fallback modifier for
+			// exactly this case (build_format_params in pipewire.cpp).
+			vk_log.infof( "no exportable tiled DRM modifier for format 0x%x with the requested usage -- falling back to LINEAR export", drmFormat );
+			imageInfo.tiling = tiling = VK_IMAGE_TILING_LINEAR;
+		}
+		else
+		{
+			// bFlippable (scanout) has always relied on the backend offering a
+			// real modifier list here; keep that contract -- a flippable image
+			// silently falling back to non-scanout-capable tiling would just
+			// fail later in less obvious ways.
+			assert( !modifiers.empty() );
+		}
 	}
 
 	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
@@ -2879,6 +2962,113 @@ bool vulkan_init_format(VkFormat format, uint32_t drmFormat)
 		wlr_drm_format_set_add( &sampledDRMFormats, drmFormat, DRM_FORMAT_MOD_INVALID );
 		return false;
 	}
+}
+
+// The set of DRM modifiers this PHYSICAL DEVICE can actually export a
+// drmFormat image as, with the given Vulkan usage flags — i.e. exactly the
+// filter CVulkanTexture::BInit's bExportTiled path applies before it'll
+// accept a modifier. Exposed so a caller negotiating a format out-of-band
+// BEFORE any CVulkanTexture exists (e.g. PipeWire SPA format negotiation)
+// can offer only modifiers that are guaranteed to also succeed when the
+// matching export texture is actually created later — otherwise the
+// negotiated choice and what BInit can allocate can silently diverge.
+//
+// Deliberately sourced from DRMModifierProps (populated once at startup by
+// vulkan_init_formats() straight from vkGetPhysicalDeviceFormatProperties2)
+// rather than GetBackend()->GetSupportedModifiers(): the backend's list is
+// "what the PARENT compositor advertised for normal window buffers" (e.g. a
+// nested Wayland backend only knows niri's RGB scanout modifiers, which for
+// a video format like NV12 is typically empty) — irrelevant here, since an
+// bExportTiled image is handed straight to an external consumer (PipeWire)
+// and never round-trips back through the backend for scanout/import. Only
+// bFlippable (real scanout) still needs backend-blessed modifiers.
+std::vector<uint64_t> vulkan_get_exportable_modifiers( uint32_t drmFormat, VkImageUsageFlags usage )
+{
+	std::vector<uint64_t> modifiers;
+
+	if ( !g_device.supportsModifiers() )
+		return modifiers;
+
+	VkFormat format = DRMFormatToVulkan( drmFormat, false );
+
+	auto formatIt = DRMModifierProps.find( format );
+	if ( formatIt == DRMModifierProps.end() || formatIt->second.empty() )
+		return modifiers;
+
+	VkImageCreateInfo imageInfo = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = format,
+		.usage = usage,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+
+	// LINEAR last: every other (tiled) candidate is preferred over it, but it's
+	// always included as the universally-supported fallback.
+	for ( const auto &[modifier, props] : formatIt->second )
+	{
+		if ( modifier == DRM_FORMAT_MOD_LINEAR )
+			continue;
+
+		VkExternalImageFormatProperties externalFormatProps = {
+			.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+		};
+		VkResult res = getModifierProps( &imageInfo, modifier, &externalFormatProps );
+		if ( res != VK_SUCCESS )
+			continue;
+
+		if ( !( externalFormatProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
+			continue;
+
+		modifiers.push_back( modifier );
+	}
+
+	if ( formatIt->second.count( DRM_FORMAT_MOD_LINEAR ) )
+	{
+		VkExternalImageFormatProperties externalFormatProps = {
+			.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+		};
+		VkResult res = getModifierProps( &imageInfo, DRM_FORMAT_MOD_LINEAR, &externalFormatProps );
+		if ( res == VK_SUCCESS && ( externalFormatProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ) )
+			modifiers.push_back( DRM_FORMAT_MOD_LINEAR );
+	}
+
+	return modifiers;
+}
+
+// How many DRM memory planes a given (drmFormat, modifier) export will have —
+// e.g. a tiled NV12 modifier typically splits luma/chroma into 2 separate
+// memory planes. Callers that need to know the plane count *before* a
+// CVulkanTexture exists (e.g. to size a consumer's buffer-block allocation
+// ahead of negotiating which modifier will be used) can use this;
+// DRMModifierProps is populated once by vulkan_init_formats().
+//
+// DRM_FORMAT_MOD_LINEAR is NOT special-cased to 1 here: that was only true
+// for the plain, non-modifier VK_IMAGE_TILING_LINEAR export used by the
+// memfd/CPU-mappable path (one packed buffer, luma then chroma). When
+// DRM_FORMAT_MOD_LINEAR is used explicitly as a modifier in the
+// VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT dmabuf-export path, this driver
+// reports it as 2 real separate memory planes for NV12 (verified via a
+// standalone Vulkan probe) — hardcoding 1 here caused a real mismatch
+// ("dmabuf.n_planes (2) > spa_buffer->n_datas (1)") once gamescope actually
+// started using that path instead of always falling back to plain LINEAR
+// tiling. Always trust the queried map instead.
+uint32_t vulkan_get_drm_format_modifier_plane_count( uint32_t drmFormat, uint64_t modifier )
+{
+	if ( modifier == DRM_FORMAT_MOD_INVALID )
+		return 1;
+
+	VkFormat format = DRMFormatToVulkan( drmFormat, false );
+
+	auto formatIt = DRMModifierProps.find( format );
+	if ( formatIt == DRMModifierProps.end() )
+		return 1;
+
+	auto modifierIt = formatIt->second.find( modifier );
+	if ( modifierIt == formatIt->second.end() )
+		return 1;
+
+	return modifierIt->second.drmFormatModifierPlaneCount;
 }
 
 bool vulkan_init_formats()
@@ -3892,7 +4082,7 @@ void bind_all_layers(CVulkanCmdBuffer* cmdBuffer, const struct FrameInfo_t *fram
 	}
 }
 
-std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, gamescope::Rc<CVulkanTexture> pYUVOutTexture )
+std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, gamescope::Rc<CVulkanTexture> pYUVOutTexture, gamescope::Rc<CVulkanTexture> pYUVExportTexture )
 {
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
 	if (!frameInfo->applyOutputColorMgmt)
@@ -3941,6 +4131,17 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 		const int dispatchSize = pixelsPerGroup * 2;
 
 		cmdBuffer->dispatch(div_roundup(pYUVOutTexture->width(), dispatchSize), div_roundup(pYUVOutTexture->height(), dispatchSize));
+
+		// splitux: copy the just-written NV12 frame into the real
+		// dmabuf-exported texture, in this SAME command buffer — chaining
+		// straight off the compute dispatch above lets copyImage's existing
+		// dirty/barrier tracking (CVulkanCmdBuffer::m_textureState) order the
+		// transfer-read after the shader-write correctly, with no separate
+		// submission or manual sync needed. See pipewire.cpp's
+		// stream_handle_add_buffer for why pYUVOutTexture and the export
+		// texture are different images in the first place.
+		if ( pYUVExportTexture != nullptr )
+			cmdBuffer->copyImage(pYUVOutTexture, pYUVExportTexture);
 	}
 
 	uint64_t sequence = g_device.submit(std::move(cmdBuffer));
