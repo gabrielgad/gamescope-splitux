@@ -45,7 +45,7 @@ jobs:
       - name: Build
         run: |
           export CC=gcc CXX=g++
-          meson build/ -Dinput_emulation=disabled -Denable_openvr_support=false --auto-features=enabled
+          meson build/ -Dinput_emulation=disabled -Denable_openvr_support=false -Dwlroots:werror=false --auto-features=enabled
           ninja -C build/
           strip build/src/gamescope build/src/gamescopectl build/src/gamescopereaper
 
