@@ -15,7 +15,17 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: [self-hosted, Linux, X64, splitux]
+    # 2026-07-03: moved off the shared bare-metal `splitux` fleet onto a
+    # dedicated ephemeral, per-repo container runner (Phase 2 of the
+    # org-wide containerization pilot - see ~/ssh-workspace/ci-runners/README.md
+    # on the lab). splitux and gbe_fork-splitux's Linux jobs keep using the
+    # shared `splitux` label, completely unaffected. This runner image only
+    # needs podman + the docker-CLI shim (podman-docker) to spin up the
+    # `container:` below via a bind-mounted host socket - it doesn't bake in
+    # meson/wlroots/etc itself, since the `Prepare` step below installs all
+    # of that fresh into this throwaway archlinux:base-devel container on
+    # every run anyway.
+    runs-on: [self-hosted, Linux, X64, gamescope-splitux-ci]
     container: archlinux:base-devel
     steps:
       - name: Prepare
